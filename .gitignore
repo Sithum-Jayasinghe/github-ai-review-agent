@@ -1,0 +1,38 @@
+# Binaries
+review-agent
+review-agent.exe
+/dist/
+
+# Go build artefacts
+*.o
+*.a
+*.so
+
+# Test cache and coverage
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Environment – NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependency vendor directory (not used, but guard against accidental adds)
+/vendor/
+
+# GitHub App private key files
+*.pem
+*.key

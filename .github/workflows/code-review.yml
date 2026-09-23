@@ -1,0 +1,161 @@
+# .github/workflows/code-review.yml
+#
+# GitHub AI PR Review Agent workflow.
+#
+# Triggers on every pull-request event that targets the main branch. The
+# workflow:
+#   1. Runs standard Go checks (fmt, vet, build, test) as separate steps so
+#      GitHub can report them as individual status checks.
+#   2. Builds the review agent binary.
+#   3. Runs the agent, which calls Gemini, posts a review comment, and
+#      requests a merge when all conditions are satisfied.
+#
+# Required repository secrets  (Settings → Secrets and variables → Actions):
+#   GEMINI_API_KEY      – Google AI Studio API key
+#
+# The workflow uses the built-in GITHUB_TOKEN for GitHub API calls.
+# For merge operations that require elevated permissions (e.g. bypassing
+# branch protection) replace GITHUB_TOKEN with a GitHub App installation
+# token stored as a repository secret.
+
+name: AI PR Review
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize   # new commits pushed to the PR branch
+      - reopened
+
+# Minimal permissions: the agent needs to read PR content, post comments,
+# submit reviews, and (optionally) merge. Write permission on pull-requests
+# covers comments and reviews; contents write is needed for the merge commit.
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  issues: write    # required to post issue comments (PR comments use the issues API)
+
+jobs:
+  # ── Job 1: Standard Go checks ───────────────────────────────────────────
+  go-checks:
+    name: Go checks
+    runs-on: ubuntu-latest
+    # Only run for PRs targeting main.
+    if: github.base_ref == 'main'
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          # Check out the PR head, not the merge commit, so checks run against
+          # exactly the code the author submitted.
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Fetch full history for accurate diff generation.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go fmt
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files need formatting:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -v -race -count=1 ./...
+
+  # ── Job 2: AI review agent ──────────────────────────────────────────────
+  ai-review:
+    name: AI review agent
+    runs-on: ubuntu-latest
+    needs: go-checks        # only run the agent after checks pass
+    if: github.base_ref == 'main'
+
+    steps:
+      - name: Checkout agent source
+        uses: actions/checkout@v4
+        with:
+          # Check out the review-agent repository (this repo).
+          # If the agent lives in a separate repo, replace this step with the
+          # appropriate checkout action for that repo.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build review agent
+        run: |
+          go build \
+            -ldflags "-X main.buildVersion=${{ github.sha }}" \
+            -o ./review-agent \
+            ./cmd/agent
+
+      - name: Run review agent
+        env:
+          # ── GitHub credentials ──────────────────────────────────────────
+          # Use the workflow's built-in token. For merge operations that need
+          # to bypass branch protection rules, replace with a PAT or App token
+          # stored as AGENT_GITHUB_TOKEN.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # ── Repository context ──────────────────────────────────────────
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO:  ${{ github.event.repository.name }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          TARGET_BRANCH: main
+
+          # ── AI provider ─────────────────────────────────────────────────
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL:   gemini-1.5-pro-latest
+
+          # ── Check configuration ─────────────────────────────────────────
+          REQUIRED_CHECKS: go-build,go-vet,go-test
+
+          # ── AI review policy ────────────────────────────────────────────
+          # advisory           : AI posts comments, never blocks
+          # block_on_critical  : blocks on critical issues only
+          # block_on_any       : blocks on any issue
+          AI_REVIEW_POLICY: advisory
+
+          # ── Merge configuration ─────────────────────────────────────────
+          # Set AUTO_MERGE_ENABLED=true only when you are ready for fully
+          # automatic merges. Start with false to validate the setup first.
+          AUTO_MERGE_ENABLED: "false"
+          MERGE_STRATEGY: squash
+
+          # ── Behaviour ───────────────────────────────────────────────────
+          LOG_LEVEL:  info
+          DRY_RUN:    "false"
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+        run: ./review-agent
+
+      - name: Upload agent log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log-${{ github.event.pull_request.number }}
+          path: |
+            *.log
+          if-no-files-found: ignore
+          retention-days: 14
